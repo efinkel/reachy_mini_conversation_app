@@ -331,6 +331,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         self._emit_debounced_partial(event.transcript, current_sequence)
                     )
 
+                # Handle failed transcription
+                if event.type == "conversation.item.input_audio_transcription.failed":
+                    logger.warning(f"Transcription failed: {event}")
+
                 # Handle completed transcription (user finished speaking)
                 if event.type == "conversation.item.input_audio_transcription.completed":
                     logger.debug(f"User transcript: {event.transcript}")
