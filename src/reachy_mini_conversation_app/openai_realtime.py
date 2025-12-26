@@ -77,7 +77,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._connected_event: asyncio.Event = asyncio.Event()
 
         # Memory auto-save threshold (saves every N exchanges to prevent data loss)
-        self._memory_save_threshold: int = 10  # Save every 10 exchanges
+        self._memory_save_threshold: int = config.MEMORY_SAVE_THRESHOLD
         self._exchange_count: int = 0  # Tracks user+assistant message pairs
 
         # Speaker notification tracking

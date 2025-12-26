@@ -37,6 +37,9 @@ class Config:
     # Mem0 memory integration (optional)
     MEM0_API_KEY = os.getenv("MEM0_API_KEY")
     REACHY_USER_ID = os.getenv("REACHY_USER_ID", "default")
+    MEMORY_SEARCH_THRESHOLD = float(os.getenv("MEMORY_SEARCH_THRESHOLD", "0.2"))  # Similarity threshold for search
+    MEMORY_SEARCH_TOP_K = int(os.getenv("MEMORY_SEARCH_TOP_K", "10"))  # Max results to return
+    MEMORY_SAVE_THRESHOLD = int(os.getenv("MEMORY_SAVE_THRESHOLD", "10"))  # Save every N exchanges
     logger.debug(f"Mem0 configured: {bool(MEM0_API_KEY)}, User ID: {REACHY_USER_ID}")
 
     # Speaker identification (optional)

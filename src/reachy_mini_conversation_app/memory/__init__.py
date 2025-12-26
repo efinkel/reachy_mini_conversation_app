@@ -61,14 +61,13 @@ def search_memories(query: str, user_id: str | None = None) -> list[dict[str, An
     try:
         # Mem0 API uses simple filter format
         # Use keyword_search for better matching of synonyms/related terms
-        # Lower threshold (default 0.3) to catch more potentially relevant memories
         filters = {"user_id": user_id}
         results = client.search(
             query,
             filters=filters,
-            threshold=0.2,
+            threshold=config.MEMORY_SEARCH_THRESHOLD,
             keyword_search=True,
-            top_k=10,
+            top_k=config.MEMORY_SEARCH_TOP_K,
         )
 
         # Log the raw response for debugging
@@ -94,7 +93,7 @@ def save_memories(messages: list[dict[str, str]], user_id: str | None = None) ->
 
     Args:
         messages: List of message dicts with 'role' and 'content' keys
-        user_id: Optional user ID (defaults to config.REACHY_USER_ID)
+        user_id: User ID (required - must be identified by speaker recognition)
 
     Returns:
         True if save succeeded, False otherwise
@@ -107,7 +106,10 @@ def save_memories(messages: list[dict[str, str]], user_id: str | None = None) ->
         logger.debug("No messages to save to memory")
         return False
 
-    user_id = user_id or config.REACHY_USER_ID
+    # Require explicit user_id - don't save to wrong user
+    if user_id is None:
+        logger.debug("No user_id provided, skipping memory save (speaker not identified)")
+        return False
     logger.info(f"Saving {len(messages)} messages to memory for user_id='{user_id}'")
 
     try:
