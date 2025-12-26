@@ -80,6 +80,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._memory_save_threshold: int = 10  # Save every 10 exchanges
         self._exchange_count: int = 0  # Tracks user+assistant message pairs
 
+        # Speaker notification tracking
+        self._last_notified_speaker: str | None = None
+        self._speaker_notification_pending: str | None = None
+
+        # Track if speaker has been confidently identified this session
+        self._speaker_confirmed: bool = False
+
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
         return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
@@ -545,6 +552,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # sends to the stream the stuff put in the output queue by the openai event handler
         # This is called periodically by the fastrtc Stream
 
+        # Handle pending speaker notification
+        if self._speaker_notification_pending is not None:
+            try:
+                await self._send_speaker_notification(self._speaker_notification_pending)
+                self._speaker_notification_pending = None
+            except Exception as e:
+                logger.debug("Speaker notification skipped: %s", e)
+
         # Handle idle
         idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
         if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
@@ -558,8 +573,51 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
 
+    def queue_speaker_notification(self, speaker_name: str) -> None:
+        """Queue a speaker notification to be sent to the AI.
+
+        Called from console.py when a speaker is identified.
+        The notification will be sent on the next emit() cycle.
+        """
+        # Mark that we've had a confident speaker identification
+        self._speaker_confirmed = True
+
+        # Only notify if this is a different speaker than last notified
+        if speaker_name != self._last_notified_speaker:
+            self._speaker_notification_pending = speaker_name
+            logger.debug(f"Queued speaker notification for: {speaker_name}")
+
+    async def _send_speaker_notification(self, speaker_name: str) -> None:
+        """Send a conversation item to inform the AI about the current speaker."""
+        if self.connection is None:
+            return
+
+        # Only notify if speaker changed
+        if speaker_name == self._last_notified_speaker:
+            return
+
+        self._last_notified_speaker = speaker_name
+
+        # Send a subtle system-like message that the AI can use
+        notification = f"[Speaker identified: {speaker_name.title()}]"
+
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": notification}],
+                },
+            )
+            logger.info(f"Notified AI about speaker: {speaker_name}")
+        except Exception as e:
+            logger.debug(f"Failed to send speaker notification: {e}")
+
     async def _save_conversation_to_memory(self) -> None:
-        """Save the conversation transcript to Mem0 memory at session end."""
+        """Save the conversation transcript to Mem0 memory.
+
+        Only saves if a speaker has been confidently identified this session.
+        """
         if self.deps.conversation_transcript is None:
             return
 
@@ -568,13 +626,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.debug("Skipping memory save: conversation too short")
             return
 
+        # Only save if we've had a confident speaker identification
+        if not self._speaker_confirmed:
+            logger.debug("Skipping memory save: no confident speaker identification yet")
+            return
+
         try:
             from reachy_mini_conversation_app.memory import save_memories
 
             user_id = getattr(self.deps, "current_user_id", None)
             success = save_memories(transcript, user_id=user_id)
             if success:
-                logger.info(f"Saved conversation ({len(transcript)} messages) to memory")
+                logger.info(f"Saved conversation ({len(transcript)} messages) to memory for user '{user_id}'")
             else:
                 logger.debug("Memory save skipped (mem0 not configured or failed)")
         except Exception as e:
@@ -587,8 +650,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         - "I'm [name]"
         - "My name is [name]"
         - "Call me [name]"
-        - "This is [name]"
-        - "[Name] here"
         """
         import re
 
@@ -601,15 +662,35 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._conversation_start_time = asyncio.get_event_loop().time()
         elapsed = asyncio.get_event_loop().time() - self._conversation_start_time
 
-        # Patterns to match name introductions
+        # More restrictive patterns - only clear name introductions
         patterns = [
-            r"\b(?:i'?m|i am)\s+(\w+)\b",           # "I'm Eric", "I am Eric"
-            r"\bmy name is\s+(\w+)\b",              # "My name is Eric"
+            r"\bmy name is\s+(\w+)\b",              # "My name is Eric" (most reliable)
             r"\bcall me\s+(\w+)\b",                 # "Call me Eric"
-            r"\bthis is\s+(\w+)\b",                 # "This is Eric"
-            r"\b(\w+)\s+here\b",                    # "Eric here"
-            r"\bit'?s\s+(\w+)\b",                   # "It's Eric"
+            r"\bi'?m\s+(\w+)(?:\s*[,.]|\s*$)",      # "I'm Eric." or "I'm Eric," (name at end)
         ]
+
+        # Comprehensive list of non-name words to filter out
+        non_names = {
+            # Pronouns and articles
+            "me", "i", "my", "the", "a", "an", "it", "this", "that", "here", "there",
+            "he", "she", "they", "we", "you", "who", "what", "which",
+            # Common verbs and verb forms
+            "also", "just", "still", "really", "actually", "basically", "literally",
+            "going", "doing", "being", "having", "getting", "making", "taking",
+            "working", "looking", "trying", "thinking", "saying", "asking", "telling",
+            "coming", "leaving", "starting", "finishing", "waiting", "running",
+            "calling", "talking", "speaking", "listening", "reading", "writing",
+            "glad", "happy", "sorry", "fine", "good", "great", "okay", "ok", "sure",
+            "ready", "excited", "tired", "busy", "free", "available", "interested",
+            # Adverbs and fillers
+            "so", "very", "too", "quite", "pretty", "rather", "almost", "always",
+            "never", "sometimes", "usually", "often", "rarely", "maybe", "perhaps",
+            "probably", "definitely", "certainly", "absolutely", "honestly",
+            # Other common words that aren't names
+            "not", "back", "home", "here", "there", "now", "then", "today", "tonight",
+            "new", "old", "next", "last", "first", "only", "own", "other", "same",
+            "wondering", "curious", "confused", "lost", "stuck", "done", "finished",
+        }
 
         transcript_lower = transcript.lower()
 
@@ -618,19 +699,25 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             if match:
                 name = match.group(1)
                 # Filter out common false positives
-                if name not in ("me", "i", "my", "the", "a", "an", "it", "this", "that", "here", "there"):
-                    if name not in mentioned_names:
-                        mentioned_names[name] = elapsed
-                        logger.info(f"Detected name mention: '{name}' at {elapsed:.1f}s")
+                if name not in non_names and len(name) >= 2:
+                    # Additional check: in original transcript, is this word capitalized?
+                    # This helps filter out "I'm working" vs "I'm Eric"
+                    name_in_original = re.search(rf"\b{re.escape(name)}\b", transcript, re.IGNORECASE)
+                    if name_in_original:
+                        actual_word = name_in_original.group(0)
+                        # Only accept if capitalized (like a proper noun) or all lowercase is ok for voice
+                        if actual_word[0].isupper() or actual_word.islower():
+                            if name not in mentioned_names:
+                                mentioned_names[name] = elapsed
+                                logger.info(f"Detected name mention: '{name}' at {elapsed:.1f}s")
 
-                        # Assign name to current/recent speaker in session tracker
-                        speaker_manager = getattr(self.deps, "speaker_manager", None)
-                        if speaker_manager is not None:
-                            # Use current time for assignment
-                            import time
-                            assigned = speaker_manager.assign_name_to_speaker(name, time.time())
-                            if assigned:
-                                logger.info(f"Assigned name '{name}' to session speaker")
+                                # Assign name to current/recent speaker in session tracker
+                                speaker_manager = getattr(self.deps, "speaker_manager", None)
+                                if speaker_manager is not None:
+                                    import time
+                                    assigned = speaker_manager.assign_name_to_speaker(name, time.time())
+                                    if assigned:
+                                        logger.info(f"Assigned name '{name}' to session speaker")
                     break
 
     async def _process_speaker_diarization(self) -> None:

@@ -107,14 +107,25 @@ class SessionSpeakerTracker:
                 return session_id, False
             else:
                 # First time seeing this known speaker in this session
-                session_id = self._create_speaker(
-                    embedding, timestamp,
-                    is_enrolled=True,
-                    known_speaker_id=known_speaker_id
-                )
-                self._known_speakers_seen[known_speaker_id] = session_id
-                logger.info(f"Known speaker '{known_speaker_id}' entered session as {session_id}")
-                return session_id, True
+                # Check if we should merge with the current/recent unknown speaker
+                merged_session_id = self._try_merge_current_to_known(known_speaker_id)
+                if merged_session_id:
+                    # Merged with existing session speaker
+                    speaker = self.speakers[merged_session_id]
+                    speaker.add_embedding(embedding, timestamp)
+                    self.current_speaker_id = merged_session_id
+                    logger.info(f"Known speaker '{known_speaker_id}' merged with {merged_session_id}")
+                    return merged_session_id, False
+                else:
+                    # Create new session speaker for this known speaker
+                    session_id = self._create_speaker(
+                        embedding, timestamp,
+                        is_enrolled=True,
+                        known_speaker_id=known_speaker_id
+                    )
+                    self._known_speakers_seen[known_speaker_id] = session_id
+                    logger.info(f"Known speaker '{known_speaker_id}' entered session as {session_id}")
+                    return session_id, True
 
         # Unknown speaker - compare to existing session speakers
         best_match: Optional[str] = None
@@ -167,6 +178,33 @@ class SessionSpeakerTracker:
         self.current_speaker_id = session_id
 
         return session_id
+
+    def _try_merge_current_to_known(self, known_speaker_id: str) -> Optional[str]:
+        """Try to merge the current unknown session speaker with a known speaker.
+
+        When we first identify a known speaker, check if the current/recent
+        session speaker is likely the same person. If so, merge them.
+
+        Args:
+            known_speaker_id: The enrolled speaker ID that was just identified
+
+        Returns:
+            Session ID if merge happened, None otherwise
+        """
+        # If there's no current speaker or it's already enrolled, no merge needed
+        if self.current_speaker_id is None:
+            return None
+
+        current = self.speakers.get(self.current_speaker_id)
+        if current is None or current.is_enrolled:
+            return None
+
+        # Merge the current unknown speaker into the known speaker
+        current.is_enrolled = True
+        current.known_speaker_id = known_speaker_id
+        self._known_speakers_seen[known_speaker_id] = self.current_speaker_id
+        logger.debug(f"Merged {self.current_speaker_id} into known speaker '{known_speaker_id}'")
+        return self.current_speaker_id
 
     def assign_name_to_recent(
         self,

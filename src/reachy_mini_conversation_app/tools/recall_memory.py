@@ -40,10 +40,19 @@ class RecallMemory(Tool):
         if not query:
             return {"error": "query must be a non-empty string"}
 
-        logger.info(f"Tool call: recall_memory query='{query}'")
-
         # Get user_id from deps if available, otherwise use default
         user_id = getattr(deps, "current_user_id", None)
+        logger.info(f"Tool call: recall_memory query='{query}', user_id='{user_id}'")
+
+        # Debug: Check how many memories exist for this user
+        try:
+            from reachy_mini_conversation_app.memory import get_all_memories
+            all_memories = get_all_memories(user_id=user_id)
+            logger.info(f"Total memories for user '{user_id}': {len(all_memories)}")
+            if all_memories:
+                logger.debug(f"Sample memory: {all_memories[0].get('memory', 'N/A')[:100]}")
+        except Exception as e:
+            logger.debug(f"Debug get_all failed: {e}")
 
         results = search_memories(query, user_id=user_id)
 

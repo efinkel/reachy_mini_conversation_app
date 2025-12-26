@@ -487,6 +487,8 @@ class LocalStream:
                             # Update current_user_id when speaker changes
                             if result.is_identified and result.speaker:
                                 self.handler.deps.current_user_id = result.speaker
+                                # Notify the AI about the identified speaker
+                                self.handler.queue_speaker_notification(result.speaker)
                                 logger.debug(f"Speaker identified: {result.speaker}")
                             elif result.is_unknown:
                                 # Keep current user or set to None for unknown

@@ -1,4 +1,4 @@
-"""Tool to enroll a speaker's voice for identification."""
+"""Tool to enroll or update a speaker's voice for identification."""
 
 import logging
 from typing import Any, Dict
@@ -10,14 +10,13 @@ logger = logging.getLogger(__name__)
 
 
 class EnrollVoice(Tool):
-    """Enroll a speaker's voice for future identification."""
+    """Enroll or update a speaker's voice for identification."""
 
     name = "enroll_voice"
     description = (
-        "Enroll a person's voice so you can recognize them in the future. "
-        "Use this when someone asks you to remember their voice. "
-        "After calling this, the person should keep talking for a few seconds "
-        "to capture enough audio for their voiceprint."
+        "Enroll or update a person's voice so you can recognize them. "
+        "Use this when someone asks you to: remember their voice, update their voiceprint, "
+        "or re-enroll. After calling this, the person should keep talking for about 5 seconds."
     )
     parameters_schema = {
         "type": "object",
@@ -57,14 +56,19 @@ class EnrollVoice(Tool):
                 "message": "Already enrolling a speaker. Please wait.",
             }
 
+        # Check if this is an update
+        is_update = name.lower().strip() in [s.lower() for s in speaker_manager.list_enrolled_speakers()]
+
         # Start enrollment - audio collection happens in the audio pipeline
         started = speaker_manager.start_enrollment(name)
 
         if started:
+            action = "Updating" if is_update else "Starting"
             return {
                 "success": True,
-                "message": f"Starting voice enrollment for {name}. Keep talking for about 5 seconds.",
+                "message": f"{action} voice enrollment for {name}. Keep talking for about 5 seconds.",
                 "enrolling": True,
+                "is_update": is_update,
             }
         else:
             return {
