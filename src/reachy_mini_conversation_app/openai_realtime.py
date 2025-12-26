@@ -711,60 +711,32 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 mentioned_names[name] = elapsed
                                 logger.info(f"Detected name mention: '{name}' at {elapsed:.1f}s")
 
-                                # Assign name to current/recent speaker in session tracker
-                                speaker_manager = getattr(self.deps, "speaker_manager", None)
-                                if speaker_manager is not None:
-                                    import time
-                                    assigned = speaker_manager.assign_name_to_speaker(name, time.time())
-                                    if assigned:
-                                        logger.info(f"Assigned name '{name}' to session speaker")
+                                # Set tentative speaker identity (will be confirmed by diarization)
+                                # The mentioned_names dict is passed to speaker_manager,
+                                # which uses it for diarization-based enrollment
+                                if self.deps.current_user_id is None:
+                                    self.deps.current_user_id = name.lower()
+                                    self.queue_speaker_notification(name)
+                                    logger.info(f"Set tentative speaker: '{name}'")
                     break
 
     async def _process_speaker_diarization(self) -> None:
-        """Enroll session speakers at conversation end.
+        """Clean up speaker identification at conversation end.
 
-        Uses the new lightweight approach:
-        1. Get speakers with names from session tracker
-        2. Enroll using accumulated embeddings (no heavy diarization needed!)
-        3. Reset session for next conversation
+        Enrollment now happens automatically via background diarization during
+        the conversation, so we just need to:
+        1. Stop background diarizer
+        2. Reset session state
         """
         speaker_manager = getattr(self.deps, "speaker_manager", None)
 
         if speaker_manager is None:
-            logger.debug("Speaker enrollment skipped: speaker_manager not configured")
+            logger.debug("Speaker cleanup skipped: speaker_manager not configured")
             return
 
         # Stop any running background diarization
         if speaker_manager.background_diarizer is not None:
             speaker_manager.background_diarizer.stop()
-
-        # Enroll speakers who were assigned names during the session
-        try:
-            unenrolled = speaker_manager.get_unenrolled_speakers_with_names()
-
-            if unenrolled:
-                logger.info(f"Enrolling {len(unenrolled)} session speakers...")
-                for session_speaker in unenrolled:
-                    success = speaker_manager.enroll_session_speaker(session_speaker)
-                    if success:
-                        logger.info(f"Enrolled voiceprint for '{session_speaker.matched_name}' "
-                                    f"({len(session_speaker.embeddings)} embeddings, "
-                                    f"{session_speaker.total_speech_time:.0f}s speech)")
-                    else:
-                        logger.warning(f"Failed to enroll '{session_speaker.matched_name}'")
-            else:
-                logger.info("No new speakers to enroll from this session")
-
-            # Log session summary
-            if speaker_manager.session_tracker is not None:
-                all_speakers = speaker_manager.session_tracker.get_all_session_speakers()
-                enrolled_count = sum(1 for s in all_speakers if s.is_enrolled)
-                named_count = sum(1 for s in all_speakers if s.matched_name)
-                logger.info(f"Session summary: {len(all_speakers)} speakers, "
-                            f"{named_count} named, {enrolled_count} enrolled")
-
-        except Exception as e:
-            logger.warning(f"Session speaker enrollment failed: {e}")
 
         # Reset session for next conversation
         try:

@@ -109,11 +109,14 @@ def run(
             min_duration=config.SPEAKER_MIN_CONVERSATION_DURATION,
         )
 
-        # Create SpeakerManager with audio_buffer for background diarization
-        speaker_manager = SpeakerManager(audio_buffer=audio_buffer)
+        # Create SpeakerManager with audio_buffer and mentioned_names for diarization-based enrollment
+        speaker_manager = SpeakerManager(
+            audio_buffer=audio_buffer,
+            mentioned_names=mentioned_names,
+        )
         if speaker_manager.initialize():
             logger.info(f"Speaker identification enabled. Enrolled: {speaker_manager.list_enrolled_speakers()}")
-            logger.info("Background diarization and session tracking enabled")
+            logger.info("Background diarization enabled for enrollment")
         else:
             logger.info("Speaker identification disabled (HF_TOKEN not set or pyannote unavailable)")
             speaker_manager = None
@@ -129,7 +132,7 @@ def run(
         camera_worker=camera_worker,
         vision_manager=vision_manager,
         head_wobbler=head_wobbler,
-        current_user_id=config.REACHY_USER_ID,
+        current_user_id=None,  # Start unknown; set by speaker identification
         conversation_transcript=conversation_transcript,
         speaker_manager=speaker_manager,
         audio_buffer=audio_buffer,

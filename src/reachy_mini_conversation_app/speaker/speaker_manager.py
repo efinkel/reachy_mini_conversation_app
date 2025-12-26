@@ -32,14 +32,13 @@ class SpeakerResult:
 class SpeakerManager:
     """Manages speaker identification using pyannote embeddings.
 
-    Now includes:
-    - Session tracking for within-conversation speaker management
-    - Background diarization triggered on new speaker detection
+    Features:
+    - Real-time speaker identification (6s embedding window)
+    - Background diarization for enrollment (triggered on unknown speaker)
     - Online adaptation of voiceprints with safeguards
     """
 
     SAMPLE_RATE = 16000
-    AUDIO_DURATION_ENROLL = 5.0  # seconds needed for enrollment (more for quality)
 
     def __init__(
         self,
@@ -47,6 +46,7 @@ class SpeakerManager:
         confidence_threshold: Optional[float] = None,
         on_speaker_change: Optional[Callable[[SpeakerResult], None]] = None,
         audio_buffer: Optional[Any] = None,  # AudioBuffer for diarization
+        mentioned_names: Optional[Dict[str, float]] = None,  # name -> timestamp for enrollment
     ):
         """Initialize the speaker manager.
 
@@ -55,11 +55,13 @@ class SpeakerManager:
             confidence_threshold: Minimum similarity for identification.
             on_speaker_change: Callback when speaker changes.
             audio_buffer: AudioBuffer instance for background diarization.
+            mentioned_names: Dict mapping names to timestamps (for diarization enrollment).
         """
         self.store = voiceprint_store or VoiceprintStore()
         self.threshold = confidence_threshold or config.SPEAKER_CONFIDENCE_THRESHOLD
         self.on_speaker_change = on_speaker_change
         self.audio_buffer = audio_buffer
+        self.mentioned_names = mentioned_names  # Reference to shared dict
 
         self._model: Any = None
         self._inference: Any = None
@@ -69,14 +71,9 @@ class SpeakerManager:
         self._current_speaker: Optional[str] = None
         self._current_confidence: float = 0.0
 
-        self._enrolling: bool = False
-        self._enroll_name: Optional[str] = None
-        self._enroll_callback: Optional[Callable[[bool, str], None]] = None
-
         self._initialized = False
 
-        # Session tracking and background diarization
-        self.session_tracker: Optional[Any] = None  # SessionSpeakerTracker
+        # Background diarization for enrollment
         self.background_diarizer: Optional[Any] = None  # BackgroundDiarizer
 
         # Online adaptation tracking (per speaker)
@@ -93,13 +90,8 @@ class SpeakerManager:
         """Confidence of current speaker identification."""
         return self._current_confidence
 
-    @property
-    def is_enrolling(self) -> bool:
-        """True if currently enrolling a new speaker."""
-        return self._enrolling
-
     def initialize(self) -> bool:
-        """Initialize pyannote model, session tracker, and background diarizer.
+        """Initialize pyannote model and background diarizer.
 
         Returns:
             True if successful, False if pyannote not available.
@@ -117,11 +109,6 @@ class SpeakerManager:
             logger.info("Loading pyannote embedding model...")
             self._model = Model.from_pretrained("pyannote/embedding", token=config.HF_TOKEN)
             self._inference = Inference(self._model, window="whole")
-
-            # Initialize session tracker
-            from reachy_mini_conversation_app.speaker.session_tracker import SessionSpeakerTracker
-            self.session_tracker = SessionSpeakerTracker()
-            logger.info("Session speaker tracker initialized")
 
             # Initialize background diarizer if we have an audio buffer
             if self.audio_buffer is not None:
@@ -144,17 +131,108 @@ class SpeakerManager:
             return False
 
     def _on_diarization_results(self, result: Dict[str, Any]) -> None:
-        """Callback when background diarization completes."""
+        """Callback when background diarization completes.
+
+        Enrolls speakers who:
+        1. Are matched to a name (via timing or voiceprint)
+        2. Have sufficient speech duration (>= MIN_ENROLLMENT_SECONDS)
+        3. Are not already enrolled
+        """
         if not result.get("success"):
             logger.warning(f"Background diarization failed: {result.get('error')}")
             return
 
         segments = result.get("segments", [])
-        if segments and self.session_tracker is not None:
-            # Update session tracker with diarization results
-            # For now, just log - full integration would update speaker boundaries
-            unique_speakers = set(s[2] for s in segments)
-            logger.info(f"Diarization found {len(unique_speakers)} speakers")
+        if not segments:
+            return
+
+        unique_speakers = set(s[2] for s in segments)
+        logger.info(f"Diarization found {len(unique_speakers)} speakers in {len(segments)} segments")
+
+        # Get audio for embedding extraction
+        if self.audio_buffer is None:
+            return
+        audio = self.audio_buffer.get_audio()
+        if audio is None:
+            return
+
+        # Match diarization speakers to names/voiceprints
+        from reachy_mini_conversation_app.speaker.diarization import (
+            match_speakers_to_names,
+            extract_speaker_segments,
+        )
+
+        speaker_to_name = match_speakers_to_names(
+            segments=segments,
+            mentioned_names=self.mentioned_names or {},
+            audio=audio,
+            sample_rate=self.SAMPLE_RATE,
+            store=self.store,
+        )
+
+        if not speaker_to_name:
+            logger.debug("No speakers matched to names in diarization results")
+            return
+
+        # Try to enroll matched speakers
+        for speaker_label, name in speaker_to_name.items():
+            # Skip already enrolled
+            if self.store.get(name) is not None:
+                logger.debug(f"Speaker '{name}' already enrolled, skipping")
+                continue
+
+            # Check minimum speech duration
+            total_speech = sum(
+                end - start for start, end, label in segments if label == speaker_label
+            )
+            if total_speech < config.SPEAKER_MIN_ENROLLMENT_SECONDS:
+                logger.info(
+                    f"Speaker '{name}' has {total_speech:.1f}s speech, "
+                    f"need {config.SPEAKER_MIN_ENROLLMENT_SECONDS}s for enrollment"
+                )
+                continue
+
+            # Extract clean segments and enroll
+            speaker_segments = extract_speaker_segments(
+                audio, segments, speaker_label, self.SAMPLE_RATE,
+                min_segment_duration=2.0, max_segments=5
+            )
+
+            if self._enroll_from_diarization(name, speaker_segments):
+                logger.info(f"Enrolled '{name}' from diarization ({total_speech:.1f}s speech)")
+
+    def _enroll_from_diarization(self, name: str, segments: list) -> bool:
+        """Enroll a speaker from clean diarization segments.
+
+        Args:
+            name: Speaker name to enroll
+            segments: List of audio segments (numpy arrays) for the speaker
+
+        Returns:
+            True if enrollment succeeded, False otherwise
+        """
+        if len(segments) < 2:
+            logger.warning(f"Not enough segments for '{name}' (need at least 2)")
+            return False
+
+        try:
+            # Extract embedding from each clean segment
+            embeddings = []
+            for seg_audio in segments:
+                emb = self._get_embedding(seg_audio)
+                embeddings.append(emb)
+
+            # Average for robustness
+            avg_embedding = np.mean(embeddings, axis=0)
+            avg_embedding = avg_embedding / np.linalg.norm(avg_embedding)
+
+            # Save voiceprint
+            self.store.save(name, avg_embedding)
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to enroll '{name}' from diarization: {e}")
+            return False
 
     def _get_embedding(self, audio: np.ndarray) -> np.ndarray:
         """Extract speaker embedding from audio.
@@ -220,8 +298,7 @@ class SpeakerManager:
         self._buffer_samples += len(audio_chunk)
 
         # Use config-based duration for identification (6 seconds default)
-        target_duration = self.AUDIO_DURATION_ENROLL if self._enrolling else config.SPEAKER_EMBEDDING_WINDOW_SECONDS
-        target_samples = int(target_duration * self.SAMPLE_RATE)
+        target_samples = int(config.SPEAKER_EMBEDDING_WINDOW_SECONDS * self.SAMPLE_RATE)
 
         if self._buffer_samples < target_samples:
             return None
@@ -231,10 +308,7 @@ class SpeakerManager:
         self._audio_buffer_internal = []
         self._buffer_samples = 0
 
-        if self._enrolling:
-            return self._complete_enrollment(audio)
-        else:
-            return self._identify_speaker(audio)
+        return self._identify_speaker(audio)
 
     def check_background_results(self) -> Optional[Dict[str, Any]]:
         """Check for completed background diarization results.
@@ -251,28 +325,18 @@ class SpeakerManager:
     def _identify_speaker(self, audio: np.ndarray) -> SpeakerResult:
         """Identify speaker from audio.
 
-        Now includes:
-        - Session tracking for within-conversation speaker management
-        - Online adaptation of known speaker voiceprints (with safeguards)
-        - Background diarization trigger on new speaker detection
+        Compares embedding to enrolled speakers. If unknown, triggers
+        background diarization to potentially enroll the speaker.
         """
         try:
             embedding = self._get_embedding(audio)
             result = self._compare_to_enrolled(embedding)
-            timestamp = time.time()
 
-            # Track in session and potentially trigger background diarization
-            if self.session_tracker is not None:
-                known_speaker_id = result.speaker if result.is_identified else None
-                session_id, is_new_to_session = self.session_tracker.process_embedding(
-                    embedding, timestamp, known_speaker_id
-                )
-
-                # If new speaker detected, trigger background diarization
-                if is_new_to_session and self.background_diarizer is not None and self.audio_buffer is not None:
-                    triggered = self.background_diarizer.trigger(self.audio_buffer)
-                    if triggered:
-                        logger.info(f"Background diarization triggered for new speaker: {session_id}")
+            # Trigger diarization on unknown speaker (for potential enrollment)
+            if result.is_unknown and self.background_diarizer is not None and self.audio_buffer is not None:
+                triggered = self.background_diarizer.trigger(self.audio_buffer)
+                if triggered:
+                    logger.info("Background diarization triggered for unknown speaker")
 
             # Online adaptation for known speakers (with safeguards)
             if result.is_identified:
@@ -349,74 +413,6 @@ class SpeakerManager:
         logger.debug(f"Adapted voiceprint for '{speaker_id}' (confidence={confidence:.2f}, count={adapt_count + 1})")
         return True
 
-    def _complete_enrollment(self, audio: np.ndarray) -> SpeakerResult:
-        """Complete speaker enrollment with collected audio."""
-        name = self._enroll_name
-        callback = self._enroll_callback
-        self._enrolling = False
-        self._enroll_name = None
-        self._enroll_callback = None
-
-        try:
-            embedding = self._get_embedding(audio)
-            self.store.save(name, embedding)
-            logger.info(f"Enrolled speaker: {name}")
-
-            if callback:
-                callback(True, f"Voice enrolled for {name}")
-
-            return SpeakerResult(speaker=name, confidence=1.0, is_unknown=False)
-        except Exception as e:
-            logger.error(f"Enrollment failed: {e}")
-            if callback:
-                callback(False, str(e))
-            return SpeakerResult(speaker=None, confidence=0.0, is_unknown=True)
-
-    def start_enrollment(
-        self,
-        name: str,
-        callback: Optional[Callable[[bool, str], None]] = None,
-    ) -> bool:
-        """Start enrolling a new speaker.
-
-        Args:
-            name: Name for the new speaker
-            callback: Called with (success, message) when enrollment completes
-
-        Returns:
-            True if enrollment started, False if not initialized or already enrolling
-        """
-        if not self._initialized:
-            if callback:
-                callback(False, "Speaker identification not initialized")
-            return False
-
-        if self._enrolling:
-            if callback:
-                callback(False, "Already enrolling a speaker")
-            return False
-
-        self._enrolling = True
-        self._enroll_name = name.lower().strip()
-        self._enroll_callback = callback
-        self._audio_buffer_internal = []
-        self._buffer_samples = 0
-
-        logger.info(f"Started enrollment for: {self._enroll_name}")
-        return True
-
-    def cancel_enrollment(self) -> None:
-        """Cancel ongoing enrollment."""
-        if self._enrolling:
-            if self._enroll_callback:
-                self._enroll_callback(False, "Enrollment cancelled")
-            self._enrolling = False
-            self._enroll_name = None
-            self._enroll_callback = None
-            self._audio_buffer_internal = []
-            self._buffer_samples = 0
-            logger.info("Enrollment cancelled")
-
     def clear_buffer(self) -> None:
         """Clear the audio buffer."""
         self._audio_buffer_internal = []
@@ -434,81 +430,13 @@ class SpeakerManager:
         """Reset session-specific state for a new conversation.
 
         Call this at the start of each new conversation to clear:
-        - Session speaker tracker
         - Adaptation counts (per-session limits)
-        - Background diarization state
         """
-        if self.session_tracker is not None:
-            self.session_tracker.reset()
-
         # Reset adaptation counts for new session
         self._adaptation_counts.clear()
         # Note: _last_adaptation_time is kept to respect cooldowns across sessions
 
         logger.info("Speaker manager session reset")
-
-    def get_unenrolled_speakers_with_names(self) -> list:
-        """Get session speakers who have names but aren't enrolled.
-
-        Returns:
-            List of SessionSpeaker objects ready for enrollment.
-        """
-        if self.session_tracker is None:
-            return []
-        return self.session_tracker.get_unenrolled_with_names()
-
-    def assign_name_to_speaker(self, name: str, timestamp: float) -> bool:
-        """Assign a name to the speaker active near a timestamp.
-
-        Call this when the user says "I'm [name]" or similar.
-
-        Args:
-            name: The name to assign
-            timestamp: When the name was mentioned
-
-        Returns:
-            True if name was assigned, False otherwise
-        """
-        if self.session_tracker is None:
-            return False
-        return self.session_tracker.assign_name_to_recent(name, timestamp)
-
-    def enroll_session_speaker(self, session_speaker) -> bool:
-        """Enroll a session speaker using their accumulated embeddings.
-
-        Args:
-            session_speaker: SessionSpeaker object with matched_name set
-
-        Returns:
-            True if enrollment succeeded, False otherwise
-        """
-        if session_speaker.matched_name is None:
-            logger.warning("Cannot enroll speaker without a name")
-            return False
-
-        if session_speaker.is_enrolled:
-            logger.debug(f"Speaker '{session_speaker.matched_name}' already enrolled")
-            return True
-
-        avg_embedding = session_speaker.get_averaged_embedding()
-        if avg_embedding is None:
-            logger.warning(f"No embeddings for speaker '{session_speaker.matched_name}'")
-            return False
-
-        # Check if we should update existing or create new
-        existing = self.store.get(session_speaker.matched_name)
-        if existing is not None:
-            # Blend with existing (weighted average favoring new)
-            blended = 0.3 * existing + 0.7 * avg_embedding
-            blended = blended / np.linalg.norm(blended)
-            self.store.save(session_speaker.matched_name, blended)
-            logger.info(f"Updated voiceprint for '{session_speaker.matched_name}' from session")
-        else:
-            self.store.save(session_speaker.matched_name, avg_embedding)
-            logger.info(f"Created voiceprint for '{session_speaker.matched_name}' from session")
-
-        session_speaker.is_enrolled = True
-        return True
 
     def stop(self) -> None:
         """Stop background processes and clean up."""

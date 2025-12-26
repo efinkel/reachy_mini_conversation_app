@@ -43,7 +43,7 @@ class Config:
     VOICEPRINT_DIR = os.getenv("VOICEPRINT_DIR", os.path.expanduser("~/.reachy_mini/voiceprints"))
     SPEAKER_CONFIDENCE_THRESHOLD = float(os.getenv("SPEAKER_CONFIDENCE_THRESHOLD", "0.50"))
     SPEAKER_DEBUG_PLOTS = os.getenv("SPEAKER_DEBUG_PLOTS", "").lower() in ("true", "1", "yes")
-    SPEAKER_MAX_BUFFER_DURATION = float(os.getenv("SPEAKER_MAX_BUFFER_DURATION", "900"))  # 15 min
+    SPEAKER_MAX_BUFFER_DURATION = float(os.getenv("SPEAKER_MAX_BUFFER_DURATION", "300"))  # 5 min (enough for diarization)
     SPEAKER_MIN_CONVERSATION_DURATION = float(os.getenv("SPEAKER_MIN_CONVERSATION_DURATION", "60"))  # 1 min
 
     # Embedding extraction
@@ -59,9 +59,8 @@ class Config:
     SPEAKER_ADAPTATION_COOLDOWN_SECONDS = float(os.getenv("SPEAKER_ADAPTATION_COOLDOWN_SECONDS", "60.0"))
     SPEAKER_ADAPTATION_MAX_PER_SESSION = int(os.getenv("SPEAKER_ADAPTATION_MAX_PER_SESSION", "10"))
 
-    # Session tracking
-    SPEAKER_SESSION_SIMILARITY_THRESHOLD = float(os.getenv("SPEAKER_SESSION_SIMILARITY_THRESHOLD", "0.40"))
-    SPEAKER_MIN_EMBEDDINGS_FOR_ENROLLMENT = int(os.getenv("SPEAKER_MIN_EMBEDDINGS_FOR_ENROLLMENT", "3"))
+    # Diarization-based enrollment
+    SPEAKER_MIN_ENROLLMENT_SECONDS = float(os.getenv("SPEAKER_MIN_ENROLLMENT_SECONDS", "20.0"))  # Min speech before enrolling
 
     logger.debug(f"Speaker identification: voiceprint_dir={VOICEPRINT_DIR}, threshold={SPEAKER_CONFIDENCE_THRESHOLD}, debug_plots={SPEAKER_DEBUG_PLOTS}")
 
