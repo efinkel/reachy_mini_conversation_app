@@ -17,6 +17,7 @@ import logging
 from typing import List, Optional
 from pathlib import Path
 
+import numpy as np
 from fastrtc import AdditionalOutputs, audio_to_float32
 from scipy.signal import resample
 
@@ -447,10 +448,57 @@ class LocalStream:
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
         logger.debug(f"Audio recording started at {input_sample_rate} Hz")
 
+        # Speaker identification setup
+        speaker_manager = getattr(self.handler.deps, "speaker_manager", None)
+        audio_buffer = getattr(self.handler.deps, "audio_buffer", None)
+        speaker_sample_rate = 16000  # pyannote expects 16kHz
+
         while not self._stop_event.is_set():
             audio_frame = self._robot.media.get_audio_sample()
             if audio_frame is not None:
+                # Send to OpenAI handler
                 await self.handler.receive((input_sample_rate, audio_frame))
+
+                # Fork audio to speaker manager and buffer if available
+                if speaker_manager is not None and speaker_manager._initialized:
+                    try:
+                        # Convert to float32 mono
+                        speaker_audio = audio_to_float32(audio_frame)
+                        if speaker_audio.ndim == 2:
+                            if speaker_audio.shape[1] > speaker_audio.shape[0]:
+                                speaker_audio = speaker_audio.T
+                            if speaker_audio.shape[1] > 1:
+                                speaker_audio = speaker_audio[:, 0]
+
+                        # Resample to 16kHz if needed
+                        if input_sample_rate != speaker_sample_rate:
+                            speaker_audio = resample(
+                                speaker_audio,
+                                int(len(speaker_audio) * speaker_sample_rate / input_sample_rate),
+                            ).astype(np.float32)
+
+                        # Add to audio buffer for post-conversation diarization
+                        if audio_buffer is not None:
+                            audio_buffer.append(speaker_audio)
+
+                        # Process for real-time speaker identification
+                        result = speaker_manager.process_audio(speaker_audio)
+                        if result is not None:
+                            # Update current_user_id when speaker changes
+                            if result.is_identified and result.speaker:
+                                self.handler.deps.current_user_id = result.speaker
+                                logger.debug(f"Speaker identified: {result.speaker}")
+                            elif result.is_unknown:
+                                # Keep current user or set to None for unknown
+                                logger.debug("Unknown speaker detected")
+
+                        # Check for completed background diarization results
+                        bg_result = speaker_manager.check_background_results()
+                        if bg_result is not None:
+                            logger.debug(f"Background diarization result received: {bg_result.get('success')}")
+                    except Exception as e:
+                        logger.debug(f"Speaker identification error: {e}")
+
             await asyncio.sleep(0)  # avoid busy loop
 
     async def play_loop(self) -> None:

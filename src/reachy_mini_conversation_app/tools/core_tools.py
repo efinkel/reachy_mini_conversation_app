@@ -55,6 +55,13 @@ class ToolDependencies:
     vision_manager: Any | None = None
     head_wobbler: Any | None = None  # HeadWobbler for audio-reactive motion
     motion_duration_s: float = 1.0
+    # Memory integration
+    current_user_id: str | None = None  # User ID for memory operations
+    conversation_transcript: list[dict[str, str]] | None = None  # For session-end save
+    # Speaker identification
+    speaker_manager: Any | None = None  # SpeakerManager for voice enrollment
+    audio_buffer: Any | None = None  # AudioBuffer for diarization
+    mentioned_names: dict[str, float] | None = None  # name -> timestamp for enrollment
 
 
 # Tool base class

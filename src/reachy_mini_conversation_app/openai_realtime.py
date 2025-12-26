@@ -69,9 +69,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.partial_transcript_sequence: int = 0  # sequence counter to prevent stale emissions
         self.partial_debounce_delay = 0.5  # seconds
 
+        # Track conversation elapsed time for name mentions
+        self._conversation_start_time: float | None = None
+
         # Internal lifecycle flags
         self._shutdown_requested: bool = False
         self._connected_event: asyncio.Event = asyncio.Event()
+
+        # Memory auto-save threshold (saves every N exchanges to prevent data loss)
+        self._memory_save_threshold: int = 10  # Save every 10 exchanges
+        self._exchange_count: int = 0  # Tracks user+assistant message pairs
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -349,10 +356,30 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                     await self.output_queue.put(AdditionalOutputs({"role": "user", "content": event.transcript}))
 
+                    # Store in conversation transcript for memory auto-save
+                    if self.deps.conversation_transcript is not None:
+                        self.deps.conversation_transcript.append({"role": "user", "content": event.transcript})
+
+                    # Check for name mentions for speaker enrollment
+                    self._extract_mentioned_name(event.transcript)
+
                 # Handle assistant transcription
                 if event.type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
                     logger.debug(f"Assistant transcript: {event.transcript}")
                     await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
+
+                    # Store in conversation transcript for memory auto-save
+                    if self.deps.conversation_transcript is not None:
+                        self.deps.conversation_transcript.append({"role": "assistant", "content": event.transcript})
+
+                        # Increment exchange count and check threshold
+                        self._exchange_count += 1
+                        if self._exchange_count >= self._memory_save_threshold:
+                            await self._save_conversation_to_memory()
+                            # Clear transcript after saving to avoid duplicates
+                            self.deps.conversation_transcript.clear()
+                            self._exchange_count = 0
+                            logger.info("Memory threshold reached, saved and cleared transcript")
 
                 # Handle audio delta
                 if event.type in ("response.audio.delta", "response.output_audio.delta"):
@@ -531,9 +558,143 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
 
+    async def _save_conversation_to_memory(self) -> None:
+        """Save the conversation transcript to Mem0 memory at session end."""
+        if self.deps.conversation_transcript is None:
+            return
+
+        transcript = self.deps.conversation_transcript
+        if not transcript or len(transcript) < 2:
+            logger.debug("Skipping memory save: conversation too short")
+            return
+
+        try:
+            from reachy_mini_conversation_app.memory import save_memories
+
+            user_id = getattr(self.deps, "current_user_id", None)
+            success = save_memories(transcript, user_id=user_id)
+            if success:
+                logger.info(f"Saved conversation ({len(transcript)} messages) to memory")
+            else:
+                logger.debug("Memory save skipped (mem0 not configured or failed)")
+        except Exception as e:
+            logger.warning(f"Failed to save conversation to memory: {e}")
+
+    def _extract_mentioned_name(self, transcript: str) -> None:
+        """Extract name mentions from user transcript for speaker enrollment.
+
+        Looks for patterns like:
+        - "I'm [name]"
+        - "My name is [name]"
+        - "Call me [name]"
+        - "This is [name]"
+        - "[Name] here"
+        """
+        import re
+
+        mentioned_names = getattr(self.deps, "mentioned_names", None)
+        if mentioned_names is None:
+            return
+
+        # Get elapsed time since conversation start
+        if self._conversation_start_time is None:
+            self._conversation_start_time = asyncio.get_event_loop().time()
+        elapsed = asyncio.get_event_loop().time() - self._conversation_start_time
+
+        # Patterns to match name introductions
+        patterns = [
+            r"\b(?:i'?m|i am)\s+(\w+)\b",           # "I'm Eric", "I am Eric"
+            r"\bmy name is\s+(\w+)\b",              # "My name is Eric"
+            r"\bcall me\s+(\w+)\b",                 # "Call me Eric"
+            r"\bthis is\s+(\w+)\b",                 # "This is Eric"
+            r"\b(\w+)\s+here\b",                    # "Eric here"
+            r"\bit'?s\s+(\w+)\b",                   # "It's Eric"
+        ]
+
+        transcript_lower = transcript.lower()
+
+        for pattern in patterns:
+            match = re.search(pattern, transcript_lower)
+            if match:
+                name = match.group(1)
+                # Filter out common false positives
+                if name not in ("me", "i", "my", "the", "a", "an", "it", "this", "that", "here", "there"):
+                    if name not in mentioned_names:
+                        mentioned_names[name] = elapsed
+                        logger.info(f"Detected name mention: '{name}' at {elapsed:.1f}s")
+
+                        # Assign name to current/recent speaker in session tracker
+                        speaker_manager = getattr(self.deps, "speaker_manager", None)
+                        if speaker_manager is not None:
+                            # Use current time for assignment
+                            import time
+                            assigned = speaker_manager.assign_name_to_speaker(name, time.time())
+                            if assigned:
+                                logger.info(f"Assigned name '{name}' to session speaker")
+                    break
+
+    async def _process_speaker_diarization(self) -> None:
+        """Enroll session speakers at conversation end.
+
+        Uses the new lightweight approach:
+        1. Get speakers with names from session tracker
+        2. Enroll using accumulated embeddings (no heavy diarization needed!)
+        3. Reset session for next conversation
+        """
+        speaker_manager = getattr(self.deps, "speaker_manager", None)
+
+        if speaker_manager is None:
+            logger.debug("Speaker enrollment skipped: speaker_manager not configured")
+            return
+
+        # Stop any running background diarization
+        if speaker_manager.background_diarizer is not None:
+            speaker_manager.background_diarizer.stop()
+
+        # Enroll speakers who were assigned names during the session
+        try:
+            unenrolled = speaker_manager.get_unenrolled_speakers_with_names()
+
+            if unenrolled:
+                logger.info(f"Enrolling {len(unenrolled)} session speakers...")
+                for session_speaker in unenrolled:
+                    success = speaker_manager.enroll_session_speaker(session_speaker)
+                    if success:
+                        logger.info(f"Enrolled voiceprint for '{session_speaker.matched_name}' "
+                                    f"({len(session_speaker.embeddings)} embeddings, "
+                                    f"{session_speaker.total_speech_time:.0f}s speech)")
+                    else:
+                        logger.warning(f"Failed to enroll '{session_speaker.matched_name}'")
+            else:
+                logger.info("No new speakers to enroll from this session")
+
+            # Log session summary
+            if speaker_manager.session_tracker is not None:
+                all_speakers = speaker_manager.session_tracker.get_all_session_speakers()
+                enrolled_count = sum(1 for s in all_speakers if s.is_enrolled)
+                named_count = sum(1 for s in all_speakers if s.matched_name)
+                logger.info(f"Session summary: {len(all_speakers)} speakers, "
+                            f"{named_count} named, {enrolled_count} enrolled")
+
+        except Exception as e:
+            logger.warning(f"Session speaker enrollment failed: {e}")
+
+        # Reset session for next conversation
+        try:
+            speaker_manager.reset_session()
+        except Exception as e:
+            logger.warning(f"Failed to reset speaker session: {e}")
+
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
+
+        # Save conversation transcript to memory before closing
+        await self._save_conversation_to_memory()
+
+        # Run post-conversation speaker diarization
+        await self._process_speaker_diarization()
+
         # Cancel any pending debounce task
         if self.partial_transcript_task and not self.partial_transcript_task.done():
             self.partial_transcript_task.cancel()

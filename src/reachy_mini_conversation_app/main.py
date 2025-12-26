@@ -19,6 +19,7 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     handle_vision_stuff,
 )
+from reachy_mini_conversation_app.config import config
 
 
 def update_chatbot(chatbot: List[Dict[str, Any]], response: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -90,12 +91,49 @@ def run(
 
     head_wobbler = HeadWobbler(set_speech_offsets=movement_manager.set_speech_offsets)
 
+    # Shared transcript for memory auto-save at session end
+    conversation_transcript: List[Dict[str, str]] = []
+
+    # Initialize speaker identification (optional, depends on pyannote.audio)
+    speaker_manager = None
+    audio_buffer = None
+    mentioned_names: Dict[str, float] = {}
+    try:
+        from reachy_mini_conversation_app.speaker.speaker_manager import SpeakerManager
+        from reachy_mini_conversation_app.speaker.audio_buffer import AudioBuffer
+
+        # Create audio buffer first so we can pass it to SpeakerManager
+        audio_buffer = AudioBuffer(
+            sample_rate=16000,
+            max_duration=config.SPEAKER_MAX_BUFFER_DURATION,
+            min_duration=config.SPEAKER_MIN_CONVERSATION_DURATION,
+        )
+
+        # Create SpeakerManager with audio_buffer for background diarization
+        speaker_manager = SpeakerManager(audio_buffer=audio_buffer)
+        if speaker_manager.initialize():
+            logger.info(f"Speaker identification enabled. Enrolled: {speaker_manager.list_enrolled_speakers()}")
+            logger.info("Background diarization and session tracking enabled")
+        else:
+            logger.info("Speaker identification disabled (HF_TOKEN not set or pyannote unavailable)")
+            speaker_manager = None
+            audio_buffer = None
+    except ImportError:
+        logger.debug("pyannote.audio not installed, speaker identification disabled")
+    except Exception as e:
+        logger.warning(f"Failed to initialize speaker identification: {e}")
+
     deps = ToolDependencies(
         reachy_mini=robot,
         movement_manager=movement_manager,
         camera_worker=camera_worker,
         vision_manager=vision_manager,
         head_wobbler=head_wobbler,
+        current_user_id=config.REACHY_USER_ID,
+        conversation_transcript=conversation_transcript,
+        speaker_manager=speaker_manager,
+        audio_buffer=audio_buffer,
+        mentioned_names=mentioned_names,
     )
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     logger.debug(f"Current file absolute path: {current_file_path}")
